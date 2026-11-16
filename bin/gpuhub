@@ -1,0 +1,913 @@
+#!/usr/bin/env bash
+# Cliente do GPU Hub (GPU compartilhada do laboratório).
+#
+# Acesso
+#   gpuhub login [url]                cola sua API key (ou Enter pra pedir acesso)
+#   gpuhub login --key ghk_... [url]  mesmo, sem perguntar (scripts)
+#   gpuhub login --admin [url]        admin/professor: login no navegador (Keycloak)
+#   gpuhub request-access [url]       pede acesso (nome, email, motivo) e espera a aprovação
+#   gpuhub whoami                     quem você é no hub, papéis e validade da key
+#   gpuhub logout                     apaga a credencial desta máquina
+#
+# Jobs
+#   gpuhub submit [opcoes] <script.py> [args...]
+#        -C, --dir DIR    pasta enviada (padrão: raiz do git do script, senão a pasta dele)
+#        --pip PKGS       pacotes extras: "a,b==1.2" ou caminho de um requirements
+#        --no-follow      só enfileira, não acompanha o log
+#   gpuhub queue [--all]              o que roda, o que espera e os últimos jobs
+#   gpuhub logs <id> [--no-follow]    acompanha (ou só mostra) o log de um job
+#   gpuhub stop <id>                  cancela um job (na fila ou rodando)
+#   gpuhub status <id>                detalhes de um job (JSON)
+#
+# Arquivos (home/... = sua pasta no hub; datasets/... = compartilhada, só leitura)
+#   gpuhub files [caminho]            lista (padrão: home)
+#   gpuhub push <arquivo|pasta> [destino]   envia (padrão: home)
+#   gpuhub pull <job-id|caminho> [destino]  baixa os resultados de um job ou um caminho
+#   gpuhub mkdir <caminho>            cria uma pasta
+#   gpuhub rm [-r] <caminho>          apaga (só dentro de home)
+#
+# Admin/professor (depois do login --admin)
+#   gpuhub admin requests [--all]     pedidos de acesso (padrão: só os pendentes)
+#   gpuhub admin approve <id> [--role pesquisador|professor] [--days N]
+#   gpuhub admin deny <id>
+#   gpuhub admin users                quem tem key, validade, último uso
+#   gpuhub admin revoke <usuario>     revoga as keys do usuário (efeito imediato)
+#   gpuhub admin rotate <usuario>     revoga e gera uma key nova (mostrada a você)
+#   gpuhub admin add <nome> <email> [--role R] [--days N]   gera a key direto
+#
+# Precisa só de bash, curl, python3 e tar. Cada comando manda
+# "Authorization: Bearer <credencial>" e quem valida é o runner do hub.
+# Credencial, em ordem: env GPUHUB_TOKEN; ~/.gpuhub/key (API key do aluno);
+# ~/.gpuhub/token.json (Keycloak, admin/professor; renovado sozinho).
+# A pasta enviada no submit exclui .git, venvs, caches e o que estiver no
+# .gpuhubignore (na raiz da pasta; um padrão por linha, sintaxe do --exclude
+# do tar). requirements.txt (raiz e pasta do script) e --pip são instalados no hub.
+# Dentro do job: /workspace = seu código, /data/home = sua pasta (o resultado
+# fica em home/jobs/<id>/), /data/datasets = datasets compartilhados.
+#
+# Variáveis: GPUHUB_URL (sobrescreve o hub do config), GPUHUB_CONFIG_DIR
+# (padrão ~/.gpuhub), GPUHUB_IMAGE (imagem alternativa, se o hub permitir),
+# GPUHUB_TOKEN (usa essa credencial direto: teste e CI).
+set -euo pipefail
+
+CONF_DIR="${GPUHUB_CONFIG_DIR:-$HOME/.gpuhub}"
+CONF="$CONF_DIR/config"
+TOKF="$CONF_DIR/token.json"
+KEYF="$CONF_DIR/key"
+REQF="$CONF_DIR/request"
+CA="$CONF_DIR/ca.crt"
+DEFAULT_URL="https://10.50.21.252"
+OIDC_PATH="/auth/realms/lab/protocol/openid-connect"
+CLIENT_ID="gpuhub-cli"
+POLL_S="${GPUHUB_POLL_SECONDS:-10}"   # intervalo da espera pela aprovação (teste usa 1)
+WARN_MB=50
+MAX_MB=300   # mesmo limite do request_body no Caddy; acima disso o hub recusaria com 413
+
+die()   { echo "erro: $*" >&2; exit 1; }
+# imprime o bloco de comentário do topo (sem o shebang) como ajuda
+usage() { awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$0" >&2; exit 1; }
+
+# arquivos temporários desta execução; apagados na saída, inclusive no Ctrl+C
+TMPS=()
+cleanup() { [ ${#TMPS[@]} -eq 0 ] || rm -rf "${TMPS[@]}"; }
+trap cleanup EXIT
+# cria o temporário numa variável global ($1 = nome) e não via $(...): dentro
+# de um subshell o registro em TMPS se perderia e o arquivo ficaria pra trás.
+mktmp() { local __f; __f="$(mktemp "${@:2}")"; TMPS+=("$__f"); printf -v "$1" '%s' "$__f"; }
+
+# curl que confia na CA interna do hub quando ela existe (Let's Encrypt: usa a do sistema)
+ccurl() { if [ -f "$CA" ]; then curl --cacert "$CA" "$@"; else curl "$@"; fi; }
+
+# lê um campo de um JSON vindo do stdin (string vazia se faltar ou for null)
+pyget() { python3 -c 'import sys,json
+try: d=json.load(sys.stdin)
+except Exception: d={}
+v=d.get(sys.argv[1],"") if isinstance(d,dict) else ""
+print("" if v is None else (json.dumps(v) if isinstance(v,(list,dict,bool)) else v))' "$1"; }
+
+urlenc() { python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe="/"))' "$1"; }
+jsonpath() { python3 -c 'import json,sys;print(json.dumps({"path":sys.argv[1]}))' "$1"; }
+
+# Perguntas vêm do /dev/tty: no `curl | bash` do instalador o stdin é o pipe.
+has_tty() { { : </dev/tty; } 2>/dev/null; }
+ask() { # $1 = pergunta -> resposta no stdout (vazio sem terminal)
+  local ans=""
+  if has_tty; then printf '%s' "$1" >/dev/tty; IFS= read -r ans </dev/tty || ans=""; fi
+  printf '%s' "$ans"
+}
+ask_secret() { # igual, sem eco: a key não fica na tela nem no scrollback
+  local ans=""
+  if has_tty; then
+    printf '%s' "$1" >/dev/tty; IFS= read -rs ans </dev/tty || ans=""; printf '\n' >/dev/tty
+  fi
+  printf '%s' "$ans"
+}
+
+# grava um segredo já com 600 (umask no subshell: nunca existe legível por outros)
+write_secret() { # $1 = arquivo, $2 = conteúdo
+  mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR"
+  ( umask 077; printf '%s\n' "$2" > "$1" ); chmod 600 "$1"
+}
+
+save_conf() {
+  mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR"
+  printf 'GPUHUB_URL=%s\n' "$GPUHUB_URL" > "$CONF"; chmod 600 "$CONF"
+}
+
+# Config: o arquivo do `login`, mas GPUHUB_URL no ambiente ganha (teste, outro hub).
+load_conf() {
+  local env_url="${GPUHUB_URL:-}"
+  if [ -f "$CONF" ]; then
+    # shellcheck disable=SC1090
+    . "$CONF"
+  fi
+  [ -n "$env_url" ] && GPUHUB_URL="$env_url"
+  [ -n "${GPUHUB_URL:-}" ] || die "esta máquina ainda não está configurada. Rode: gpuhub login"
+  GPUHUB_URL="${GPUHUB_URL%/}"
+}
+
+# URL do hub para login/request-access: argumento > env > config > padrão.
+# Aceita só o IP/host: sem esquema vira https://
+pick_url() { # $1 = url do argumento (pode ser vazio)
+  local env_url="${GPUHUB_URL:-}"
+  GPUHUB_URL=""
+  if [ -f "$CONF" ]; then
+    # shellcheck disable=SC1090
+    . "$CONF"
+  fi
+  [ -n "$env_url" ] && GPUHUB_URL="$env_url"
+  [ -n "${1:-}" ] && GPUHUB_URL="$1"
+  GPUHUB_URL="${GPUHUB_URL:-$DEFAULT_URL}"
+  case "$GPUHUB_URL" in http://*|https://*) ;; *) GPUHUB_URL="https://$GPUHUB_URL" ;; esac
+  GPUHUB_URL="${GPUHUB_URL%/}"
+}
+
+save_tok() { # $1 = resposta JSON do token endpoint
+  python3 -c 'import sys,json,time
+d=json.loads(sys.argv[1]); now=int(time.time())
+json.dump({"access_token":d["access_token"],
+           "refresh_token":d.get("refresh_token",""),
+           "exp":now+int(d.get("expires_in",300))-30}, open(sys.argv[2],"w"))' "$1" "$TOKF"
+  chmod 600 "$TOKF"
+}
+
+# imprime a credencial: GPUHUB_TOKEN > API key > token do Keycloak (renovando)
+get_token() {
+  if [ -n "${GPUHUB_TOKEN:-}" ]; then echo "$GPUHUB_TOKEN"; return; fi
+  if [ -s "$KEYF" ]; then tr -d '[:space:]' < "$KEYF"; echo; return; fi
+  if [ ! -f "$TOKF" ]; then
+    [ -f "$REQF" ] && die "seu pedido de acesso ainda não foi aprovado. Acompanhe com: gpuhub login"
+    die "sem credencial nesta máquina. Rode: gpuhub login (cole sua API key ou peça acesso)"
+  fi
+  local now exp; now=$(date +%s)
+  exp=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("exp",0))' "$TOKF")
+  if [ "$now" -lt "$exp" ]; then
+    python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["access_token"])' "$TOKF"; return
+  fi
+  local rt; rt=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("refresh_token",""))' "$TOKF")
+  [ -n "$rt" ] || die "sessão expirou. Rode: gpuhub login --admin"
+  local resp; resp="$(ccurl -sS -d grant_type=refresh_token -d client_id=$CLIENT_ID -d refresh_token="$rt" "$GPUHUB_URL$OIDC_PATH/token")" \
+    || die "não alcancei $GPUHUB_URL; você está na rede do campus/VPN?"
+  [ -n "$(echo "$resp" | pyget access_token)" ] || die "sessão expirou. Rode: gpuhub login --admin"
+  save_tok "$resp"
+  python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["access_token"])' "$TOKF"
+}
+
+# A credencial vai num arquivo de header (curl -H @arquivo) e não na linha de
+# comando: argv de processo é visível pra qualquer usuário da máquina (ps).
+set_auth() { # $1 = credencial
+  mktmp AUTH_HDR; chmod 600 "$AUTH_HDR"
+  printf 'Authorization: Bearer %s\n' "$1" > "$AUTH_HDR"
+}
+load_auth() {
+  load_conf
+  local t; t="$(get_token)"
+  set_auth "$t"
+}
+
+unreachable() { die "não alcancei $GPUHUB_URL; você está na rede do campus/VPN?"; }
+
+# extrai o "detail" do corpo de erro do hub (ou o texto cru)
+err_detail() { # $1 = arquivo com o corpo
+  python3 -c 'import sys,json
+raw=open(sys.argv[1],encoding="utf-8",errors="replace").read().strip()
+try:
+    d=json.loads(raw); v=d.get("detail") if isinstance(d,dict) else None
+    print(v if isinstance(v,str) else (json.dumps(v,ensure_ascii=False) if v else raw))
+except Exception:
+    print(raw[:500])' "$1"
+}
+
+# traduz um status HTTP de erro numa mensagem que diz o que fazer
+http_fail() { # $1 = código, $2 = arquivo com o corpo
+  local msg; msg="$(err_detail "$2")"; rm -f "$2"
+  case "$1" in
+    401)
+      case "$msg" in
+        *revogad*|*expirad*) die "o hub recusou sua key: $msg (401). Peça uma nova com: gpuhub request-access (ou fale com o professor)" ;;
+        *) die "o hub recusou sua credencial (401)${msg:+: $msg}. Rode: gpuhub login" ;;
+      esac ;;
+    403) die "sem permissão (403): ${msg:-seu papel não permite isso}" ;;
+    404) die "não encontrado (404): ${msg:-job ou caminho inexistente?}" ;;
+    400|409|422) die "${msg:-pedido inválido ($1)}" ;;
+    413) die "envio grande demais (413). Tire dados/checkpoints da pasta (liste no .gpuhubignore); dados grandes vão com: gpuhub push" ;;
+    429) die "muitos pedidos (429): ${msg:-espere um pouco e tente de novo}" ;;
+    000) unreachable ;;
+    5??) die "o hub respondeu erro $1: ${msg:-erro interno}. Tente de novo; se persistir, avise o admin" ;;
+    *)   die "o hub respondeu $1: $msg" ;;
+  esac
+}
+
+# req ARQ_CORPO METODO /caminho [args do curl] -> imprime o código HTTP
+# (000 = não conectou). Manda a credencial só se load_auth/set_auth rodou:
+# os endpoints de pedido de acesso são públicos.
+req() {
+  local out="$1" method="$2" path="$3"; shift 3
+  local auth=()
+  [ -n "${AUTH_HDR:-}" ] && auth=(-H "@$AUTH_HDR")
+  ccurl -s -o "$out" -w '%{http_code}' -X "$method" ${auth[@]+"${auth[@]}"} "$@" "$GPUHUB_URL/api$path" || true
+}
+
+# api METODO /caminho [args extras do curl] -> corpo no stdout se 2xx.
+# Quase sempre roda dentro de $(...), onde o trap EXIT não vale: por isso o
+# temporário do corpo é apagado aqui mesmo, e não pelo cleanup.
+api() {
+  local method="$1" path="$2" body code; shift 2
+  body="$(mktemp)"
+  code="$(req "$body" "$method" "$path" "$@")"
+  case "$code" in
+    2??) cat "$body"; rm -f "$body" ;;
+    *)   http_fail "$code" "$body" ;;
+  esac
+}
+
+# com corpo JSON
+api_json() { api "$1" "$2" -H 'Content-Type: application/json' --data-binary "$3"; }
+
+# CA interna: servida sem auth de propósito (você precisa dela antes de confiar
+# no hub). Com Let's Encrypt isso dá 404 e a gente usa a CA do sistema.
+fetch_ca() {
+  mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR"
+  case "$GPUHUB_URL" in https://*) ;; *) return 0 ;; esac   # http:// só em teste local
+  local ca_tmp; mktmp ca_tmp
+  if curl -fsSk --connect-timeout 5 "$GPUHUB_URL/ca.crt" -o "$ca_tmp" 2>/dev/null && openssl x509 -in "$ca_tmp" -noout >/dev/null 2>&1; then
+    cp "$ca_tmp" "$CA"; chmod 644 "$CA"; echo "CA interna do hub salva em $CA"
+  else
+    rm -f "$CA"; echo "Hub usa certificado público (sem CA própria)."
+  fi
+}
+
+# ---------------------------------------------------------------- acesso
+
+cmd_login() {
+  local admin=0 key="" url=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --admin) admin=1; shift ;;
+      --key)   [ $# -ge 2 ] || die "--key precisa da key (ghk_...)"; key="$2"; shift 2 ;;
+      --key=*) key="${1#*=}"; shift ;;
+      -h|--help) usage ;;
+      -*) die "opção desconhecida: $1" ;;
+      *)  url="$1"; shift ;;
+    esac
+  done
+  pick_url "$url"
+  if [ "$admin" = 1 ]; then login_admin; return; fi
+
+  # pedido de acesso em andamento: retoma a espera em vez de perguntar a key
+  if [ -z "$key" ] && [ -f "$REQF" ]; then
+    echo "Você já tem um pedido de acesso em andamento; retomando a espera."
+    save_conf; wait_request; return
+  fi
+  if [ -z "$key" ]; then
+    has_tty || die "sem terminal pra perguntar. Use: gpuhub login --key ghk_... $GPUHUB_URL"
+    key="$(ask_secret "Cole sua API key (ou Enter para pedir acesso): ")"
+    key="${key//[[:space:]]/}"
+    if [ -z "$key" ]; then fetch_ca; save_conf; cmd_request_access; return; fi
+  fi
+  [[ "$key" =~ ^ghk_[A-Za-z0-9]{40}$ ]] \
+    || die "isso não parece uma API key do hub (formato: ghk_ seguido de 40 letras/números)"
+
+  fetch_ca
+  set_auth "$key"
+  local me; me="$(api GET /me)"   # valida antes de salvar: key errada não fica no disco
+  write_secret "$KEYF" "$key"
+  save_conf
+  echo "Logado como $(echo "$me" | pyget user) (key salva em $KEYF)."
+  echo "Manda um treino com: gpuhub submit seu_treino.py"
+}
+
+# admin/professor: device-flow do Keycloak (mostra URL + código pra aprovar no navegador)
+login_admin() {
+  fetch_ca
+  local OIDC="$GPUHUB_URL$OIDC_PATH"
+  local dev; dev="$(ccurl -fsS -d client_id=$CLIENT_ID -d scope=openid "$OIDC/auth/device" 2>/dev/null)" \
+    || die "não consegui falar com $GPUHUB_URL. O hub está no ar? Você está na rede do campus/VPN?"
+  local dc uc vuri iv
+  dc="$(echo "$dev" | pyget device_code)"
+  uc="$(echo "$dev" | pyget user_code)"
+  vuri="$(echo "$dev" | pyget verification_uri_complete)"
+  [ -n "$vuri" ] || vuri="$(echo "$dev" | pyget verification_uri)"
+  iv="$(echo "$dev" | pyget interval)"; [ -n "$iv" ] || iv=5
+  [ -n "$dc" ] || die "resposta inesperada do Keycloak no device endpoint"
+
+  echo
+  echo "  Abra no navegador:  $vuri"
+  echo "  Código:             $uc"
+  echo
+  echo "Aguardando você aprovar..."
+  while :; do
+    sleep "$iv"
+    local resp; resp="$(ccurl -sS -d grant_type=urn:ietf:params:oauth:grant-type:device_code -d client_id=$CLIENT_ID -d device_code="$dc" "$OIDC/token")"
+    if [ -n "$(echo "$resp" | pyget access_token)" ]; then save_tok "$resp"; break; fi
+    case "$(echo "$resp" | pyget error)" in
+      authorization_pending) : ;;
+      slow_down) iv=$((iv+5)) ;;
+      "") : ;;
+      *) die "login falhou: $(echo "$resp" | pyget error_description)" ;;
+    esac
+  done
+  # a API key ganha do token na ordem das credenciais: se ficasse, os comandos
+  # admin sairiam com o papel da key. Guarda de lado em vez de apagar.
+  if [ -f "$KEYF" ]; then
+    mv "$KEYF" "$KEYF.bak"
+    echo "(a API key desta máquina foi movida para $KEYF.bak; o login do Keycloak passa a valer)"
+  fi
+  save_conf
+  echo "Pronto. Painel: $GPUHUB_URL/jobs   |   pedidos: gpuhub admin requests"
+}
+
+cmd_request_access() {
+  # vindo do login, GPUHUB_URL já está escolhida e pick_url "" a mantém
+  pick_url "${1:-}"
+  if [ -f "$REQF" ]; then
+    echo "Você já tem um pedido de acesso em andamento; retomando a espera."
+    save_conf; wait_request; return
+  fi
+  # Sem terminal, aceita pelo ambiente (automação/teste).
+  local name="${GPUHUB_REQ_NAME:-}" email="${GPUHUB_REQ_EMAIL:-}" reason="${GPUHUB_REQ_REASON:-}"
+  echo "Pedido de acesso ao GPU Hub ($GPUHUB_URL). Um professor/admin aprova."
+  [ -n "$name" ]   || name="$(ask "Nome completo: ")"
+  [ -n "$email" ]  || email="$(ask "Email institucional: ")"
+  [ -n "$reason" ] || reason="$(ask "Pra que vai usar a GPU (projeto, orientador): ")"
+  { [ -n "$name" ] && [ -n "$email" ] && [ -n "$reason" ]; } || die "preciso de nome, email e motivo"
+
+  local body resp tok id
+  body="$(python3 -c 'import json,sys;print(json.dumps({"name":sys.argv[1],"email":sys.argv[2],"reason":sys.argv[3]}))' "$name" "$email" "$reason")"
+  resp="$(api_json POST /access-requests "$body")"
+  tok="$(echo "$resp" | pyget status_token)"; id="$(echo "$resp" | pyget id)"
+  [ -n "$tok" ] || die "resposta inesperada do hub: $resp"
+  # o status_token é o que permite buscar a key depois: segredo, 600
+  write_secret "$REQF" "$(python3 -c 'import json,sys;print(json.dumps({"url":sys.argv[1],"id":sys.argv[2],"token":sys.argv[3]}))' \
+    "$GPUHUB_URL" "$id" "$tok")"
+  save_conf
+  echo "Pedido #$id enviado."
+  wait_request
+}
+
+# consulta o pedido a cada POLL_S segundos até aprovar/recusar
+wait_request() {
+  local tok; tok="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["token"])' "$REQF" 2>/dev/null)" \
+    || { rm -f "$REQF"; die "o arquivo $REQF estava corrompido; rode: gpuhub request-access"; }
+  local body; mktmp body
+  echo "aguardando aprovação... (Ctrl+C para sair; depois rode: gpuhub login)"
+  local warned=0 code st key user
+  while :; do
+    code="$(req "$body" GET "/access-requests/status?token=$(urlenc "$tok")")"
+    case "$code" in
+      200)
+        st="$(pyget status < "$body")"; key="$(pyget api_key < "$body")"; user="$(pyget user < "$body")"
+        case "$st" in
+          approved)
+            rm -f "$REQF"
+            [ -n "$key" ] || die "seu pedido foi aprovado, mas a key já tinha sido entregue antes (outra máquina?). Peça ao professor uma key nova"
+            write_secret "$KEYF" "$key"
+            echo "acesso liberado como $user (key salva em $KEYF)"
+            echo "Manda um treino com: gpuhub submit seu_treino.py"
+            return 0 ;;
+          denied) rm -f "$REQF"; die "seu pedido de acesso foi recusado. Fale com o professor" ;;
+        esac ;;
+      404) rm -f "$REQF"; die "o hub não conhece mais esse pedido. Peça de novo: gpuhub request-access" ;;
+      000) [ "$warned" = 1 ] || echo "(sem conexão com o hub; sigo tentando...)" >&2; warned=1 ;;
+      *)   http_fail "$code" "$body" ;;
+    esac
+    sleep "$POLL_S"
+  done
+}
+
+cmd_whoami() {
+  load_auth
+  api GET /me | python3 -c 'import json,sys
+d=json.load(sys.stdin)
+via={"apikey":"API key","keycloak":"login Keycloak"}.get(d.get("via"),d.get("via"))
+print("usuario :", d.get("user"))
+print("papeis  :", ", ".join(d.get("roles") or []) or "-")
+print("via     :", via)
+print("validade:", d.get("expires_at") or "sem validade")'
+  echo "hub     : $GPUHUB_URL"
+}
+
+cmd_logout() {
+  rm -f "$KEYF" "$TOKF" "$REQF"
+  echo "Credenciais desta máquina apagadas (a key continua válida no hub até ser revogada)."
+}
+
+# ---------------------------------------------------------------- jobs
+
+# mostra o log de um job; ao fim sai 0 se succeeded, 1 caso contrário
+follow_logs() { # $1 = id, $2 = 1 (seguir ao vivo) | 0 (só o que já existe), $3 = 1 (dica do pull)
+  local id="$1" follow="${2:-1}" hint="${3:-0}" rc=0
+  DETACHED=0
+  # Ctrl+C aqui só desanexa: o job é do hub, não deste terminal. O SIGINT mata
+  # o curl (mesmo grupo de processos); o bash espera ele sair e roda o trap.
+  trap 'DETACHED=1' INT
+  # -N: sem buffer, a linha aparece assim que o treino imprime. -f: erro HTTP
+  # vira exit 22 (a mensagem detalhada já saiu no GET do job feito antes).
+  ccurl -s -N -f -H "@$AUTH_HDR" "$GPUHUB_URL/api/jobs/$id/logs?follow=$follow" || rc=$?
+  trap - INT
+  if [ "$DETACHED" = 1 ]; then
+    echo >&2
+    echo "job continua rodando — acompanhe com: gpuhub logs $id | pare com: gpuhub stop $id" >&2
+    exit 130
+  fi
+  case "$rc" in
+    0) : ;;
+    22) die "o hub recusou o log do job $id (veja: gpuhub status $id; se for credencial, gpuhub login)" ;;
+    6|7|28|35|60) unreachable ;;
+    *) echo "conexão com o log caiu (curl $rc). O job segue no hub — reconecte com: gpuhub logs $id" >&2; exit 1 ;;
+  esac
+  local st; st="$(api GET "/jobs/$id" | pyget status)"
+  # --no-follow num job que ainda não acabou: só olhou, não é falha
+  if [ "$follow" = 0 ]; then
+    case "$st" in queued|running) exit 0 ;; esac
+  fi
+  [ "$hint" = 1 ] && pull_hint "$id"
+  [ "$st" = succeeded ] && exit 0
+  exit 1
+}
+
+pull_hint() { echo "resultados: gpuhub pull $1  (ou aba Arquivos em $GPUHUB_URL/jobs)" >&2; }
+
+cmd_submit() {
+  local dir="" pip="" follow=1 script=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -C|--dir)    [ $# -ge 2 ] || die "$1 precisa de uma pasta"; dir="$2"; shift 2 ;;
+      --dir=*)     dir="${1#*=}"; shift ;;
+      --pip)       [ $# -ge 2 ] || die "--pip precisa de pacotes ou de um arquivo"; pip="$2"; shift 2 ;;
+      --pip=*)     pip="${1#*=}"; shift ;;
+      --no-follow) follow=0; shift ;;
+      -h|--help)   usage ;;
+      --)          shift; break ;;
+      -*)          die "opção desconhecida: $1 (opções do gpuhub vêm ANTES do script; depois dele tudo vai pro seu script)" ;;
+      *)           break ;;
+    esac
+  done
+  script="${1:-}"; [ -n "$script" ] || usage; shift
+  [ -f "$script" ] || die "não achei o arquivo '$script'"
+  load_auth
+
+  local script_abs script_dir
+  script_dir="$(cd "$(dirname "$script")" && pwd -P)"
+  script_abs="$script_dir/$(basename "$script")"
+  # Padrão = raiz do git: o treino quase sempre importa módulos irmãos do repo
+  # (ex.: train/x.py faz `import vigia`); mandar só a pasta do script quebraria.
+  if [ -n "$dir" ]; then
+    [ -d "$dir" ] || die "a pasta '$dir' não existe"
+  else
+    dir="$(git -C "$script_dir" rev-parse --show-toplevel 2>/dev/null || echo "$script_dir")"
+  fi
+  dir="$(cd "$dir" && pwd -P)"
+  local entry
+  entry="$(python3 -c 'import os,sys;print(os.path.relpath(sys.argv[1],sys.argv[2]))' "$script_abs" "$dir")"
+  case "$entry" in ../*|..) die "o script '$script' está fora da pasta enviada ($dir)" ;; esac
+
+  # Empacota. Fica de fora o que é grande e inútil no hub (venv, git, caches)
+  # e o que o .gpuhubignore listar. Comentários/linhas vazias saem do ignore:
+  # o tar trataria cada linha como padrão literal.
+  local work tarf
+  mktmp work -d; tarf="$work/code.tar.gz"
+  local tar_args=(-czf "$tarf"
+    --exclude=.git --exclude=.venv --exclude=venv --exclude=__pycache__ --exclude='*.pyc'
+    --exclude=node_modules --exclude=build --exclude=dist --exclude=.mypy_cache --exclude=.pytest_cache)
+  if [ -f "$dir/.gpuhubignore" ]; then
+    sed -e 's/\r$//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e '/^#/d' -e '/^$/d' \
+      "$dir/.gpuhubignore" > "$work/ignore"
+    tar_args+=(--exclude-from="$work/ignore")
+  fi
+  local extra=()
+  if [ -n "$pip" ]; then
+    # vira .gpuhub-requirements.txt na raiz do tar; o runner instala por último
+    mkdir "$work/extra"
+    if [ -f "$pip" ]; then
+      cp "$pip" "$work/extra/.gpuhub-requirements.txt"
+    else
+      printf '%s\n' "$pip" | tr ',' '\n' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e '/^$/d' \
+        > "$work/extra/.gpuhub-requirements.txt"
+    fi
+    # Se a pasta já tiver um .gpuhub-requirements.txt, o do --pip entra depois
+    # no tar e ganha na extração. (--exclude não serve: excluiria os dois.)
+    [ -f "$dir/.gpuhub-requirements.txt" ] && echo "Aviso: --pip substitui o .gpuhub-requirements.txt da pasta." >&2
+    extra=(-C "$work/extra" ./.gpuhub-requirements.txt)
+  fi
+  tar "${tar_args[@]}" -C "$dir" . ${extra[@]+"${extra[@]}"} || die "falhou ao empacotar $dir"
+
+  local bytes mb human
+  bytes="$(wc -c < "$tarf" | tr -d ' ')"
+  mb=$(( (bytes + 1048575) / 1048576 ))
+  if [ "$bytes" -lt 1048576 ]; then human="$(( (bytes + 1023) / 1024 ))KB"; else human="${mb}MB"; fi
+  if [ "$mb" -gt "$MAX_MB" ]; then
+    die "o pacote de $dir deu ${mb}MB (limite ${MAX_MB}MB). Tire dados/checkpoints da pasta
+  (liste no .gpuhubignore) ou use -C pra mandar uma pasta menor. Dados grandes: gpuhub push (o job lê de /data/home)."
+  elif [ "$mb" -gt "$WARN_MB" ]; then
+    echo "Aviso: o pacote de $dir deu ${mb}MB e sobe inteiro a cada submit." >&2
+    echo "       Dados grandes: mande uma vez com gpuhub push e leia de /data/home no job." >&2
+  fi
+
+  # JSON dos args via python: aspas, espaços e acentos chegam intactos no script
+  local args_json
+  args_json="$(python3 -c 'import json,sys;print(json.dumps(sys.argv[1:]))' "$@")"
+
+  echo "Enviando $dir ($human) -> $entry ..." >&2
+  # --form-string: entrypoint/args são texto puro; com -F, um ';' ou '@' no
+  # valor seria interpretado pelo curl (tipo, arquivo).
+  local img=()
+  [ -n "${GPUHUB_IMAGE:-}" ] && img=(--form-string "image=$GPUHUB_IMAGE")
+  local resp id pos
+  resp="$(api POST /jobs -F "code=@$tarf;type=application/gzip" \
+    --form-string "entrypoint=$entry" --form-string "args=$args_json" ${img[@]+"${img[@]}"})"
+  id="$(echo "$resp" | pyget id)"
+  pos="$(echo "$resp" | pyget position)"
+  [ -n "$id" ] || die "resposta inesperada do hub: $resp"
+  if [ -n "$pos" ] && [ "$pos" != 1 ]; then
+    echo "job $id na fila (posição $pos)." >&2
+  else
+    echo "job $id enfileirado (próximo a rodar)." >&2
+  fi
+  if [ "$follow" = 0 ]; then
+    echo "acompanhe com: gpuhub logs $id | pare com: gpuhub stop $id" >&2
+    pull_hint "$id"
+    return 0
+  fi
+  follow_logs "$id" 1 1
+}
+
+cmd_queue() {
+  local all=0 limit=50
+  [ "${1:-}" = "--all" ] && { all=1; limit=500; }
+  load_auth
+  local gpu jobs
+  gpu="$( (api GET /gpu) 2>/dev/null || true)"   # GPU é enfeite: se falhar, mostra só a fila
+  jobs="$(api GET "/jobs?limit=$limit")"
+  python3 -c '
+import json, sys
+from datetime import datetime, timezone
+
+jobs = json.loads(sys.argv[1]); show_all = sys.argv[3] == "1"
+try:
+    g = json.loads(sys.argv[2])
+    if g.get("name"):
+        mem = "%s/%s MB" % (g.get("mem_used_mb"), g.get("mem_total_mb")) if g.get("mem_total_mb") else "?"
+        util = "%s%%" % g["util_pct"] if g.get("util_pct") is not None else "?"
+        print("GPU: %s  mem %s  uso %s\n" % (g["name"], mem, util))
+except Exception:
+    pass
+
+def ago(s):
+    if not s:
+        return "-"
+    t = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=timezone.utc)
+    sec = int((datetime.now(timezone.utc) - t).total_seconds())
+    for n, u in ((86400, "d"), (3600, "h"), (60, "min")):
+        if sec >= n:
+            return "%d%s" % (sec // n, u)
+    return "%ds" % max(sec, 0)
+
+def st(j):
+    if j["status"] == "queued" and j.get("position"):
+        return "queued (%s)" % j["position"]
+    if j["status"] == "failed" and j.get("exit_code") is not None:
+        return "failed (exit %s)" % j["exit_code"]
+    return j["status"]
+
+# em cima o que importa agora: o que roda, depois a fila na ordem em que vai rodar
+running = [j for j in jobs if j["status"] == "running"]
+queued = sorted([j for j in jobs if j["status"] == "queued"], key=lambda j: j.get("position") or 0)
+done = [j for j in jobs if j["status"] not in ("running", "queued")]
+rows = running + queued + (done if show_all else done[:10])
+if not rows:
+    print("nenhum job ainda. Mande um com: gpuhub submit seu_treino.py"); sys.exit()
+
+table = [("ID", "USUARIO", "STATUS", "SCRIPT", "HA")]
+for j in rows:
+    table.append((str(j["id"]), j.get("user") or "-", st(j), j.get("entrypoint") or "-", ago(j.get("created_at"))))
+w = [max(len(r[i]) for r in table) for i in range(5)]
+for r in table:
+    print("  ".join(c.ljust(w[i]) for i, c in enumerate(r)).rstrip())
+if not show_all and len(done) > 10:
+    print("\n(%d jobs antigos ocultos; gpuhub queue --all)" % (len(done) - 10))
+' "$jobs" "$gpu" "$all"
+}
+
+need_id() { [[ "${1:-}" =~ ^[0-9]+$ ]] || die "informe o id numérico (veja: gpuhub queue / gpuhub admin requests)"; }
+
+cmd_logs() {
+  local id="" follow=1 a
+  for a in "$@"; do
+    case "$a" in
+      --no-follow) follow=0 ;;
+      *) id="$a" ;;
+    esac
+  done
+  need_id "$id"; load_auth
+  api GET "/jobs/$id" >/dev/null   # 404/401/403 com mensagem clara antes de abrir o stream
+  follow_logs "$id" "$follow"
+}
+
+cmd_stop() {
+  need_id "${1:-}"; load_auth
+  api DELETE "/jobs/$1" >/dev/null
+  echo "job $1 cancelado."
+}
+
+cmd_status() {
+  need_id "${1:-}"; load_auth
+  api GET "/jobs/$1" | python3 -m json.tool
+}
+
+# ---------------------------------------------------------------- arquivos
+
+# caminho lógico do hub: "home/..." ou "datasets/..."; sem barra no fim.
+# Quem garante o isolamento é o runner; aqui é só pra errar cedo e claro.
+norm_remote() { # $1 -> stdout
+  local p="${1:-home}"
+  p="${p#/}"; p="${p%/}"
+  case "$p" in home|home/*|datasets|datasets/*) ;; *) die "caminho do hub começa com home/ ou datasets/ (veio: $1)" ;; esac
+  printf '%s' "$p"
+}
+
+cmd_files() {
+  local p; p="$(norm_remote "${1:-home}")"
+  load_auth
+  api GET "/files?path=$(urlenc "$p")" | python3 -c 'import json,sys
+d=json.load(sys.stdin); es=d.get("entries") or []
+def hum(n):
+    if n is None: return "-"
+    for u in ("B","KB","MB","GB"):
+        if n < 1024 or u == "GB": return ("%d%s" % (n,u)) if u == "B" else ("%.1f%s" % (n,u))
+        n /= 1024
+print(d.get("path") or sys.argv[1])
+if not es: print("  (vazio)"); sys.exit()
+es.sort(key=lambda e: (e.get("type") != "dir", e.get("name","")))
+for e in es:
+    isdir = e.get("type") == "dir"
+    print("  %-9s %-16s %s%s" % ("-" if isdir else hum(e.get("size")), (e.get("modified") or "")[:16].replace("T"," "),
+                                e.get("name"), "/" if isdir else ""))' "$p"
+}
+
+remote_mkdir() { # $1 = caminho lógico; "já existe" não é erro
+  local body code; mktmp body
+  code="$(req "$body" POST /files/mkdir -H 'Content-Type: application/json' --data-binary "$(jsonpath "$1")")"
+  case "$code" in
+    2??|409) : ;;
+    400) grep -qi 'exist' "$body" || http_fail "$code" "$body" ;;
+    *) http_fail "$code" "$body" ;;
+  esac
+}
+
+upload_one() { # $1 = arquivo local, $2 = pasta destino (lógica), $3 = rótulo do progresso
+  local f="$1" q sz
+  # nome entre aspas: com -F, um ';' ou ',' no nome seria lido pelo curl como opção
+  q="${f//\\/\\\\}"; q="${q//\"/\\\"}"
+  sz="$(wc -c < "$f" | tr -d ' ')"
+  printf '%s (%s KB) ... ' "$3" "$(( (sz + 1023) / 1024 ))" >&2
+  api POST /files/upload --form-string "path=$2" -F "file=@\"$q\"" >/dev/null
+  echo "ok" >&2
+}
+
+# o que nunca sobe numa pasta (igual ao submit): grande e inútil no hub
+PRUNE=( \( -name .git -o -name .venv -o -name venv -o -name __pycache__ -o -name node_modules \) -prune )
+
+cmd_push() {
+  local src="${1:-}"; [ -n "$src" ] || die "uso: gpuhub push <arquivo|pasta> [destino no hub, padrão home]"
+  [ -e "$src" ] || die "não achei '$src'"
+  local dest; dest="$(norm_remote "${2:-home}")"
+  load_auth
+  if [ -f "$src" ]; then
+    upload_one "$src" "$dest" "$(basename "$src")"
+    echo "enviado para $dest/$(basename "$src")"
+    return
+  fi
+  # pasta: recria a árvore (mkdir) e manda arquivo a arquivo — simples e dá
+  # progresso por arquivo; se cair no meio, é só mandar de novo
+  local base top list total i=0 rel d
+  base="$(cd "$src" && pwd -P)"
+  top="$dest/$(basename "$base")"
+  remote_mkdir "$top"
+  mktmp list
+  ( cd "$base" && find . "${PRUNE[@]}" -o \( -type d -o -type f \) -print0 ) > "$list"
+  total="$( (cd "$base" && find . "${PRUNE[@]}" -o -type f -print) | wc -l | tr -d ' ')"
+  while IFS= read -r -d '' rel; do
+    rel="${rel#./}"; [ "$rel" = "." ] && continue
+    if [ -d "$base/$rel" ]; then
+      remote_mkdir "$top/$rel"
+    else
+      i=$((i+1))
+      d="$(dirname "$rel")"; if [ "$d" = "." ]; then d=""; else d="/$d"; fi
+      upload_one "$base/$rel" "$top$d" "[$i/$total] $rel"
+    fi
+  done < "$list"
+  echo "enviado: $i arquivo(s) para $top"
+}
+
+download_one() { # $1 = caminho lógico, $2 = arquivo local
+  local tmp="$2.part" code
+  mkdir -p "$(dirname "$2")"
+  code="$(req "$tmp" GET "/files/download?path=$(urlenc "$1")")"
+  case "$code" in
+    2??) mv "$tmp" "$2" ;;
+    *) http_fail "$code" "$tmp" ;;
+  esac
+}
+
+# baixa uma pasta do hub recursivamente
+pull_dir() { # $1 = caminho lógico, $2 = pasta local, $3 = relativo à raiz do pull
+  local remote="$1" local_dir="$2" relbase="${3:-}" listing t name rel
+  mkdir -p "$local_dir"
+  listing="$(api GET "/files?path=$(urlenc "$remote")" | python3 -c 'import json,sys
+for e in json.load(sys.stdin).get("entries") or []:
+    print("%s\t%s" % ("d" if e.get("type") == "dir" else "f", e.get("name")))')"
+  while IFS=$'\t' read -r t name; do
+    [ -n "$name" ] || continue
+    rel="${relbase:+$relbase/}$name"
+    # pacotes do pip --user e o HOME do job ficam dentro de code/: pesados e inúteis aqui
+    if [ "$PULL_JOB" = 1 ]; then
+      case "$rel" in code/.local|code/.home|code/.cache) continue ;; esac
+    fi
+    if [ "$t" = d ]; then
+      pull_dir "$remote/$name" "$local_dir/$name" "$rel"
+    else
+      echo "  $rel" >&2
+      download_one "$remote/$name" "$local_dir/$name"
+      PULLED=$((PULLED+1))
+    fi
+  done <<< "$listing"
+}
+
+cmd_pull() {
+  local what="${1:-}"; [ -n "$what" ] || die "uso: gpuhub pull <job-id|caminho> [destino local]"
+  load_auth
+  PULL_JOB=0; PULLED=0
+  local remote dest body code
+  if [[ "$what" =~ ^[0-9]+$ ]]; then
+    PULL_JOB=1; remote="home/jobs/$what"; dest="${2:-job-$what}"
+    echo "baixando os arquivos do job $what para $dest/" >&2
+    pull_dir "$remote" "$dest" ""
+    echo "pronto: $PULLED arquivo(s) em $dest/ (log em $dest/log.txt)"
+    return
+  fi
+  remote="$(norm_remote "$what")"
+  # pasta ou arquivo? listar só funciona em pasta
+  mktmp body
+  code="$(req "$body" GET "/files?path=$(urlenc "$remote")")"
+  case "$code" in
+    2??)
+      dest="${2:-.}/$(basename "$remote")"
+      echo "baixando $remote/ para $dest/" >&2
+      pull_dir "$remote" "$dest" ""
+      echo "pronto: $PULLED arquivo(s) em $dest/" ;;
+    000) unreachable ;;
+    401|403) http_fail "$code" "$body" ;;
+    *)
+      dest="${2:-.}"
+      [ -d "$dest" ] && dest="$dest/$(basename "$remote")"
+      download_one "$remote" "$dest"
+      echo "baixado: $dest" ;;
+  esac
+}
+
+cmd_rm() {
+  local rec=0 p="" a
+  for a in "$@"; do case "$a" in -r|-rf|--recursive) rec=1 ;; *) p="$a" ;; esac; done
+  [ -n "$p" ] || die "uso: gpuhub rm [-r] <home/caminho>"
+  p="$(norm_remote "$p")"
+  [ "$p" != home ] || die "não dá pra apagar a home inteira"
+  load_auth
+  local q; q="path=$(urlenc "$p")"; [ "$rec" = 1 ] && q="$q&recursive=1"
+  api DELETE "/files?$q" >/dev/null
+  echo "apagado: $p"
+}
+
+cmd_mkdir() {
+  [ -n "${1:-}" ] || die "uso: gpuhub mkdir <home/caminho>"
+  local p; p="$(norm_remote "$1")"
+  load_auth
+  api_json POST /files/mkdir "$(jsonpath "$p")" >/dev/null
+  echo "criado: $p"
+}
+
+# ---------------------------------------------------------------- admin
+
+# lê --role/--days e imprime o JSON; com EXTRA_EMAIL inclui nome/email (admin add)
+role_days_json() {
+  local role="pesquisador" days=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --role)   [ $# -ge 2 ] || die "--role precisa de pesquisador ou professor"; role="$2"; shift 2 ;;
+      --role=*) role="${1#*=}"; shift ;;
+      --days)   [ $# -ge 2 ] || die "--days precisa de um número"; days="$2"; shift 2 ;;
+      --days=*) days="${1#*=}"; shift ;;
+      *) die "opção desconhecida: $1" ;;
+    esac
+  done
+  [ -z "$days" ] || [[ "$days" =~ ^[0-9]+$ ]] || die "--days precisa de um número inteiro"
+  python3 -c 'import json,sys,os
+d={"role":sys.argv[1],"expires_days":int(sys.argv[2]) if sys.argv[2] else None}
+if os.environ.get("EXTRA_EMAIL"): d.update(name=os.environ.get("EXTRA_NAME",""), email=os.environ["EXTRA_EMAIL"])
+print(json.dumps(d))' "$role" "$days"
+}
+
+show_key() { # $1 = JSON com api_key, $2 = usuário (se a resposta não trouxer)
+  local key user; key="$(echo "$1" | pyget api_key)"; user="$(echo "$1" | pyget user)"; user="${user:-${2:-}}"
+  [ -n "$key" ] || die "resposta inesperada do hub: $1"
+  echo "key ${user:+de $user }(aparece só agora; repasse por um canal privado):"
+  echo
+  echo "    $key"
+  echo
+  echo "a pessoa instala o cliente e roda: gpuhub login   (e cola a key)"
+}
+
+cmd_admin() {
+  local sub="${1:-}" resp q id
+  [ $# -gt 0 ] && shift
+  case "$sub" in requests|approve|deny|users|revoke|rotate|add) ;;
+    *) die "subcomando admin: requests | approve | deny | users | revoke | rotate | add (ajuda: gpuhub help)" ;;
+  esac
+  load_auth
+  case "$sub" in
+    requests)
+      q="?status=pending"; [ "${1:-}" = "--all" ] && q=""
+      api GET "/admin/requests$q" | python3 -c 'import json,sys
+rs=json.load(sys.stdin); pend=bool(sys.argv[1])
+if not rs: print("nenhum pedido" + (" pendente" if pend else "")); sys.exit()
+for r in rs:
+    extra = "" if r.get("status") == "pending" else "  [%s por %s]" % (r.get("status"), r.get("decided_by") or "-")
+    print("#%s  %s <%s>  %s%s" % (r["id"], r.get("name"), r.get("email"), (r.get("created_at") or "")[:16].replace("T"," "), extra))
+    print("     motivo: %s" % (r.get("reason") or "-"))
+if pend: print("\naprovar: gpuhub admin approve <id> [--role professor] [--days N]  |  recusar: gpuhub admin deny <id>")' "$q" ;;
+    approve)
+      need_id "${1:-}"; id="$1"; shift
+      # JSON antes, em variável: um die dentro de "$(...)" num argumento não pararia o comando
+      q="$(role_days_json "$@")"
+      resp="$(api_json POST "/admin/requests/$id/approve" "$q")"
+      echo "pedido #$id aprovado: usuário $(echo "$resp" | pyget user)."
+      echo "a key vai só pro solicitante (o gpuhub dele pega sozinho, ou ele roda: gpuhub login)." ;;
+    deny)
+      need_id "${1:-}"; api POST "/admin/requests/$1/deny" >/dev/null; echo "pedido #$1 recusado." ;;
+    users)
+      api GET /admin/users | python3 -c 'import json,sys
+us=json.load(sys.stdin)
+if not us: print("nenhum usuário com key ainda"); sys.exit()
+d=lambda s: (s or "-")[:10]
+t=[("USUARIO","PAPEL","KEY","EXPIRA","ULTIMO USO","SITUACAO","EMAIL")]
+for u in us:
+    t.append((u.get("user") or "-", u.get("role") or "-", u.get("key_prefix") or "-", d(u.get("expires_at")),
+              d(u.get("last_used_at")), "revogada" if u.get("revoked") else "ativa", u.get("email") or "-"))
+w=[max(len(r[i]) for r in t) for i in range(len(t[0]))]
+for r in t: print("  ".join(c.ljust(w[i]) for i,c in enumerate(r)).rstrip())' ;;
+    revoke)
+      [ -n "${1:-}" ] || die "uso: gpuhub admin revoke <usuario>"
+      api POST "/admin/users/$(urlenc "$1")/revoke" >/dev/null; echo "keys de $1 revogadas (vale na hora)." ;;
+    rotate)
+      [ -n "${1:-}" ] || die "uso: gpuhub admin rotate <usuario>"
+      resp="$(api POST "/admin/users/$(urlenc "$1")/rotate")"
+      echo "keys antigas de $1 revogadas."; show_key "$resp" "$1" ;;
+    add)
+      [ $# -ge 2 ] || die "uso: gpuhub admin add <nome> <email> [--role R] [--days N]"
+      local name="$1" email="$2"; shift 2
+      q="$(EXTRA_NAME="$name" EXTRA_EMAIL="$email" role_days_json "$@")"
+      resp="$(api_json POST /admin/users "$q")"
+      show_key "$resp" ;;
+  esac
+}
+
+case "${1:-}" in
+  login)          shift; cmd_login "$@" ;;
+  request-access) shift; cmd_request_access "$@" ;;
+  whoami)         shift; cmd_whoami "$@" ;;
+  logout)         shift; cmd_logout "$@" ;;
+  submit)         shift; cmd_submit "$@" ;;
+  queue)          shift; cmd_queue "$@" ;;
+  logs)           shift; cmd_logs "$@" ;;
+  stop)           shift; cmd_stop "$@" ;;
+  status)         shift; cmd_status "$@" ;;
+  files|ls)       shift; cmd_files "$@" ;;
+  push)           shift; cmd_push "$@" ;;
+  pull)           shift; cmd_pull "$@" ;;
+  rm)             shift; cmd_rm "$@" ;;
+  mkdir)          shift; cmd_mkdir "$@" ;;
+  admin)          shift; cmd_admin "$@" ;;
+  *)              usage ;;
+esac

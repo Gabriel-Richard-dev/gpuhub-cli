@@ -1,0 +1,11 @@
+# credenciais nunca entram no repo (o cliente guarda em ~/.gpuhub, mas por garantia)
+.gpuhub/
+key
+token.json
+*.crt
+# lixo de editor/sistema e dos testes
+*.swp
+*~
+.DS_Store
+__pycache__/
+job-*/
