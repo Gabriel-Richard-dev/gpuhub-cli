@@ -74,8 +74,9 @@ GPU Hub no "Run and Debug" e aperte **F5**. Ele usa a mesma key do `gpuhub`.
 | `/workspace`     | o seu código (cwd do script)                             |
 | `/data/home`     | a sua pasta no hub (leitura e escrita)                   |
 | `/data/datasets` | datasets compartilhados do lab (só leitura)              |
+| `/data/hd`       | o HD do lab: as pastas de todos no servidor (só leitura) |
 
-O job também recebe as variáveis `GPUHUB_HOME`, `GPUHUB_DATASETS`,
+O job também recebe as variáveis `GPUHUB_HOME`, `GPUHUB_DATASETS`, `GPUHUB_HD`,
 `GPUHUB_JOB_ID` e `GPUHUB_USER`. Cada job ganha a pasta `home/jobs/<id>/`, com o
 código e o `log.txt`. Salve os resultados ali ou em qualquer lugar de
 `/data/home`.
@@ -87,7 +88,7 @@ leia de `/data/home`:
 gpuhub push meu_dataset/              # vai para home/meu_dataset/
 gpuhub files home/meu_dataset         # lista
 gpuhub pull home/runs/melhor.pt .     # baixa um arquivo ou pasta
-gpuhub rm -r home/runs/velho          # apaga (só dentro de home)
+gpuhub rm -r home/runs/velho          # apaga (dentro de home/ ou hd/)
 ```
 
 ## Datasets
@@ -130,6 +131,28 @@ com a cota estourada, só os próximos envios são recusados.
 lê, só professor/admin escreve. Dataset que a turma toda usa, peça para o
 professor colocar lá em vez de cada um subir uma cópia.
 
+## HD do lab (`hd/`)
+
+`hd/` é o disco de dados do servidor inteiro (`/data`), com as pastas antigas
+do lab (`Compartilhado/`, a pasta de cada pessoa etc.). Todo mundo com acesso
+ao hub lista e baixa; quem não é só-leitura também envia, cria pastas e apaga:
+
+```bash
+gpuhub files hd                          # o que tem no HD
+gpuhub pull hd/Compartilhado/modelo.pt . # baixa
+gpuhub push resultados/ hd/Compartilhado # envia (também em partes e retomável)
+```
+
+- `hd/` **não conta** na sua cota, e é de todos: o que você apaga lá some para
+  todo mundo. Cuidado com `gpuhub rm -r hd/...`.
+- As pastas internas do hub (`users/`, `gpuhub-jobs/`) e nomes começando com
+  `.` não aparecem. `pesquisa/` só aparece para professor/admin.
+  `hd/datasets` é a mesma pasta de `datasets/` (só professor/admin escreve).
+- No job o HD aparece em `/data/hd` (variável `GPUHUB_HD`), **só leitura**.
+  Para gravar resultado, use `/data/home`.
+- Pelo navegador: aba **Arquivos** da página `/jobs` (botão "HD do lab"), ou o
+  Filebrowser em `https://<hub>/files/`, que usa o mesmo login da página.
+
 ## Comandos
 
 | Comando | O que faz |
@@ -143,7 +166,7 @@ professor colocar lá em vez de cada um subir uma cópia.
 | `gpuhub logs <id> [--no-follow]` | log do job |
 | `gpuhub stop <id>` | cancela o job |
 | `gpuhub status <id>` | detalhes do job (JSON) |
-| `gpuhub files [caminho]` | lista `home/...` ou `datasets/...` |
+| `gpuhub files [caminho]` | lista `home/...`, `datasets/...` ou `hd/...` |
 | `gpuhub push [--overwrite] <arquivo\|pasta> [destino]` | envia (padrão: `home`); incremental e retomável |
 | `gpuhub quota` | quanto da sua cota você usa |
 | `gpuhub pull <id\|caminho> [destino]` | baixa resultados de um job ou um caminho |

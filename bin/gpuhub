@@ -19,8 +19,9 @@
 #   gpuhub stop <id>                  cancela um job (na fila ou rodando)
 #   gpuhub status <id>                detalhes de um job (JSON)
 #
-# Arquivos (home/... = sua pasta no hub; datasets/... = compartilhada, só leitura)
-#   gpuhub files [caminho]            lista (padrão: home)
+# Arquivos (home/... = sua pasta no hub; datasets/... = compartilhada, só leitura;
+#           hd/... = o HD do lab, o /data do servidor com as pastas de todos)
+#   gpuhub files [caminho]            lista (padrão: home; ex.: gpuhub files hd)
 #   gpuhub push [--overwrite] <arquivo|pasta> [destino]   envia (padrão: home)
 #        incremental: pula o que já está no hub com o mesmo tamanho; arquivo
 #        acima de 50 MB vai em partes e, se a conexão cair (ou Ctrl+C), rodar o
@@ -30,7 +31,8 @@
 #   gpuhub quota                      quanto da sua cota (home/) você usa
 #   gpuhub pull <job-id|caminho> [destino]  baixa os resultados de um job ou um caminho
 #   gpuhub mkdir <caminho>            cria uma pasta
-#   gpuhub rm [-r] <caminho>          apaga (só dentro de home)
+#   gpuhub rm [-r] <caminho>          apaga (dentro de home/ ou hd/)
+#   hd/ não conta na sua cota e é de todos: o que você apaga lá some pra todo mundo.
 #
 # Admin/professor (depois do login --admin)
 #   gpuhub admin requests [--all]     pedidos de acesso (padrão: só os pendentes)
@@ -50,7 +52,8 @@
 # .gpuhubignore (na raiz da pasta; um padrão por linha, sintaxe do --exclude
 # do tar). requirements.txt (raiz e pasta do script) e --pip são instalados no hub.
 # Dentro do job: /workspace = seu código, /data/home = sua pasta (o resultado
-# fica em home/jobs/<id>/), /data/datasets = datasets compartilhados.
+# fica em home/jobs/<id>/), /data/datasets = datasets compartilhados e
+# /data/hd = o HD do lab (os dois últimos só leitura; env GPUHUB_HD).
 #
 # Variáveis: GPUHUB_URL (sobrescreve o hub do config), GPUHUB_CONFIG_DIR
 # (padrão ~/.gpuhub), GPUHUB_IMAGE (imagem alternativa, se o hub permitir),
@@ -654,12 +657,13 @@ cmd_status() {
 
 # ---------------------------------------------------------------- arquivos
 
-# caminho lógico do hub: "home/..." ou "datasets/..."; sem barra no fim.
-# Quem garante o isolamento é o runner; aqui é só pra errar cedo e claro.
+# caminho lógico do hub: "home/...", "datasets/..." ou "hd/..."; sem barra no fim.
+# Quem garante o isolamento (e o que cada papel pode) é o runner; aqui é só
+# pra errar cedo e claro.
 norm_remote() { # $1 -> stdout
   local p="${1:-home}"
   p="${p#/}"; p="${p%/}"
-  case "$p" in home|home/*|datasets|datasets/*) ;; *) die "caminho do hub começa com home/ ou datasets/ (veio: $1)" ;; esac
+  case "$p" in home|home/*|datasets|datasets/*|hd|hd/*) ;; *) die "caminho do hub começa com home/, datasets/ ou hd/ (veio: $1)" ;; esac
   printf '%s' "$p"
 }
 
@@ -1027,9 +1031,9 @@ cmd_pull() {
 cmd_rm() {
   local rec=0 p="" a
   for a in "$@"; do case "$a" in -r|-rf|--recursive) rec=1 ;; *) p="$a" ;; esac; done
-  [ -n "$p" ] || die "uso: gpuhub rm [-r] <home/caminho>"
+  [ -n "$p" ] || die "uso: gpuhub rm [-r] <home/caminho|hd/caminho>"
   p="$(norm_remote "$p")"
-  [ "$p" != home ] || die "não dá pra apagar a home inteira"
+  case "$p" in home|hd|datasets) die "não dá pra apagar a raiz $p/ inteira" ;; esac
   load_auth
   local q; q="path=$(urlenc "$p")"; [ "$rec" = 1 ] && q="$q&recursive=1"
   api DELETE "/files?$q" >/dev/null
@@ -1037,14 +1041,14 @@ cmd_rm() {
 }
 
 cmd_mkdir() {
-  [ -n "${1:-}" ] || die "uso: gpuhub mkdir <home/caminho>"
+  [ -n "${1:-}" ] || die "uso: gpuhub mkdir <home/caminho|hd/caminho>"
   local p; p="$(norm_remote "$1")"
   load_auth
   api_json POST /files/mkdir "$(jsonpath "$p")" >/dev/null
   echo "criado: $p"
 }
 
-# Cota da home (home/, inclusive home/jobs). datasets/ não conta.
+# Cota da home (home/, inclusive home/jobs). datasets/ e hd/ não contam.
 cmd_quota() {
   load_auth
   api GET /quota | python3 -c 'import json,sys
