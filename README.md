@@ -90,6 +90,46 @@ gpuhub pull home/runs/melhor.pt .     # baixa um arquivo ou pasta
 gpuhub rm -r home/runs/velho          # apaga (só dentro de home)
 ```
 
+## Datasets
+
+Dataset grande (dezenas de GB) sobe uma vez para a sua pasta no hub e todo
+treino lê de lá:
+
+```bash
+gpuhub push dados/ home/dados     # envia a pasta para home/dados
+gpuhub push dados/ home/dados     # de novo: pula o que já está igual no hub
+```
+
+- Arquivos acima de 50 MB vão em partes. Se a conexão cair (ou você der
+  Ctrl+C), rode o **mesmo comando** de novo: ele continua de onde parou, sem
+  reenviar o que já chegou. Falhas rápidas de rede são tentadas de novo sozinhas.
+- Arquivo com o mesmo nome e o mesmo tamanho no hub conta como igual e é
+  pulado. Se mudou de tamanho, o do hub é mantido; use `--overwrite` para
+  substituir.
+- Pela página (`https://<hub>/jobs`, aba **Arquivos**) dá para arrastar
+  arquivos e pastas; arquivo grande também vai em partes e, se a página fechar,
+  escolher o mesmo arquivo de novo retoma.
+
+No treino, leia da sua pasta pela variável `GPUHUB_HOME`:
+
+```python
+import os
+dados = os.path.join(os.environ["GPUHUB_HOME"], "dados")
+```
+
+A sua pasta é montada ao vivo no job: um arquivo que termina de subir enquanto o
+treino roda já aparece lá dentro (só aparece inteiro, nunca pela metade).
+
+Cada pessoa tem uma **cota** de espaço na home (padrão 200 GB; os resultados em
+`home/jobs/` contam). Veja quanto usa com `gpuhub quota` e apague o que não usa
+com `gpuhub rm -r`. Precisa de mais? Fale com o professor. A cota é conferida
+nos envios: o que um job grava conta no uso, mas não interrompe o treino;
+com a cota estourada, só os próximos envios são recusados.
+
+`datasets/` (`/data/datasets` no job) é a área compartilhada do lab: todo mundo
+lê, só professor/admin escreve. Dataset que a turma toda usa, peça para o
+professor colocar lá em vez de cada um subir uma cópia.
+
 ## Comandos
 
 | Comando | O que faz |
@@ -104,7 +144,8 @@ gpuhub rm -r home/runs/velho          # apaga (só dentro de home)
 | `gpuhub stop <id>` | cancela o job |
 | `gpuhub status <id>` | detalhes do job (JSON) |
 | `gpuhub files [caminho]` | lista `home/...` ou `datasets/...` |
-| `gpuhub push <arquivo\|pasta> [destino]` | envia (padrão: `home`) |
+| `gpuhub push [--overwrite] <arquivo\|pasta> [destino]` | envia (padrão: `home`); incremental e retomável |
+| `gpuhub quota` | quanto da sua cota você usa |
 | `gpuhub pull <id\|caminho> [destino]` | baixa resultados de um job ou um caminho |
 | `gpuhub mkdir <caminho>` / `gpuhub rm [-r] <caminho>` | cria / apaga |
 | `gpuhub logout` | apaga a credencial desta máquina |
@@ -136,6 +177,7 @@ gpuhub admin users                # quem tem key, validade, último uso
 gpuhub admin revoke fulano        # efeito imediato
 gpuhub admin rotate fulano        # revoga e gera uma nova (mostrada a você)
 gpuhub admin add "Nome" email@ifce.edu.br --role professor
+gpuhub admin quota fulano 500     # cota da home em GB (ou "padrao")
 ```
 
 Ao aprovar um pedido, a key vai direto para quem pediu; o admin não a vê. Só em

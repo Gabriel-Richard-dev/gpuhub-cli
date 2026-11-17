@@ -21,7 +21,13 @@
 #
 # Arquivos (home/... = sua pasta no hub; datasets/... = compartilhada, só leitura)
 #   gpuhub files [caminho]            lista (padrão: home)
-#   gpuhub push <arquivo|pasta> [destino]   envia (padrão: home)
+#   gpuhub push [--overwrite] <arquivo|pasta> [destino]   envia (padrão: home)
+#        incremental: pula o que já está no hub com o mesmo tamanho; arquivo
+#        acima de 50 MB vai em partes e, se a conexão cair (ou Ctrl+C), rodar o
+#        mesmo push de novo continua de onde parou. Pasta vai para destino/<nome>
+#        (se o destino já termina com o nome dela, não aninha: push dados home/dados).
+#        --overwrite substitui o que está no hub com tamanho diferente.
+#   gpuhub quota                      quanto da sua cota (home/) você usa
 #   gpuhub pull <job-id|caminho> [destino]  baixa os resultados de um job ou um caminho
 #   gpuhub mkdir <caminho>            cria uma pasta
 #   gpuhub rm [-r] <caminho>          apaga (só dentro de home)
@@ -34,6 +40,7 @@
 #   gpuhub admin revoke <usuario>     revoga as keys do usuário (efeito imediato)
 #   gpuhub admin rotate <usuario>     revoga e gera uma key nova (mostrada a você)
 #   gpuhub admin add <nome> <email> [--role R] [--days N]   gera a key direto
+#   gpuhub admin quota <usuario> <gb|padrao>   muda a cota da home do usuário
 #
 # Precisa só de bash, curl, python3 e tar. Cada comando manda
 # "Authorization: Bearer <credencial>" e quem valida é o runner do hub.
@@ -62,6 +69,10 @@ CLIENT_ID="gpuhub-cli"
 POLL_S="${GPUHUB_POLL_SECONDS:-10}"   # intervalo da espera pela aprovação (teste usa 1)
 WARN_MB=50
 MAX_MB=300   # mesmo limite do request_body no Caddy; acima disso o hub recusaria com 413
+# push: acima disso o arquivo vai em partes (retomável); abaixo, upload simples
+BIG_BYTES=$((50 * 1048576))
+PUT_TRIES=5                           # tentativas seguidas por parte antes de desistir
+RETRY_S="${GPUHUB_RETRY_SECONDS:-2}"  # espera base entre tentativas, dobra a cada falha (teste usa 0)
 
 die()   { echo "erro: $*" >&2; exit 1; }
 # imprime o bloco de comentário do topo (sem o shebang) como ajuda
@@ -210,7 +221,11 @@ http_fail() { # $1 = código, $2 = arquivo com o corpo
     403) die "sem permissão (403): ${msg:-seu papel não permite isso}" ;;
     404) die "não encontrado (404): ${msg:-job ou caminho inexistente?}" ;;
     400|409|422) die "${msg:-pedido inválido ($1)}" ;;
-    413) die "envio grande demais (413). Tire dados/checkpoints da pasta (liste no .gpuhubignore); dados grandes vão com: gpuhub push" ;;
+    413)
+      case "$msg" in
+        *cota*) die "$msg. Veja o uso com: gpuhub quota; libere espaço com: gpuhub rm (ou peça mais cota ao professor)" ;;
+        *) die "envio grande demais (413). Tire dados/checkpoints da pasta (liste no .gpuhubignore); dados grandes vão com: gpuhub push" ;;
+      esac ;;
     429) die "muitos pedidos (429): ${msg:-espere um pouco e tente de novo}" ;;
     000) unreachable ;;
     5??) die "o hub respondeu erro $1: ${msg:-erro interno}. Tente de novo; se persistir, avise o admin" ;;
@@ -677,49 +692,270 @@ remote_mkdir() { # $1 = caminho lógico; "já existe" não é erro
   esac
 }
 
+# bytes -> "1.2 GB" (awk: o bash não faz conta com fração)
+hum() { awk -v n="$1" 'BEGIN { split("B KB MB GB TB", u, " "); i = 1
+  while (n >= 1024 && i < 5) { n /= 1024; i++ }
+  if (i == 1) printf "%d B", n; else printf (n < 10 ? "%.1f %s" : "%.0f %s"), n, u[i] }'; }
+
 upload_one() { # $1 = arquivo local, $2 = pasta destino (lógica), $3 = rótulo do progresso
   local f="$1" q sz
   # nome entre aspas: com -F, um ';' ou ',' no nome seria lido pelo curl como opção
   q="${f//\\/\\\\}"; q="${q//\"/\\\"}"
   sz="$(wc -c < "$f" | tr -d ' ')"
-  printf '%s (%s KB) ... ' "$3" "$(( (sz + 1023) / 1024 ))" >&2
+  printf '%s (%s) ... ' "$3" "$(hum "$sz")" >&2
   api POST /files/upload --form-string "path=$2" -F "file=@\"$q\"" >/dev/null
   echo "ok" >&2
+}
+
+# Espera antes da próxima tentativa: RETRY_S, 2x, 4x... (2, 4, 8, 16, 32 s).
+# Conexão de fora do campus cai à toa; uma falha isolada não pode matar um
+# envio de horas. Depois de PUT_TRIES falhas seguidas desiste, mas o que já
+# subiu fica no hub e o mesmo push continua dali.
+backoff() { # $1 = nº da tentativa que falhou (1..), $2 = o que falhou
+  [ "$1" -le "$PUT_TRIES" ] \
+    || die "$2: falhou $PUT_TRIES vezes seguidas. Rode o mesmo gpuhub push de novo quando a conexão voltar: o envio continua de onde parou"
+  local w=$(( RETRY_S << ($1 - 1) ))
+  printf '\n  %s; nova tentativa em %ss (%s/%s)\n' "$2" "$w" "$1" "$PUT_TRIES" >&2
+  sleep "$w"
+}
+
+# Recorta n bytes do arquivo a partir de offset num temporário, lendo de 1 MiB
+# em 1 MiB: nunca carrega o arquivo (dezenas de GB) na memória. python em vez
+# de dd porque o offset que o hub devolve não é múltiplo de bloco nenhum (uma
+# parte pode ter chegado pela metade) e o dd do macOS não tem skip_bytes.
+cut_part() { # $1 = arquivo, $2 = offset, $3 = bytes, $4 = saída
+  python3 -c 'import sys
+src, off, n, dst = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
+with open(src, "rb") as a, open(dst, "wb") as b:
+    a.seek(off)
+    while n > 0:
+        c = a.read(min(n, 1 << 20))
+        if not c:
+            sys.exit("o arquivo local encolheu durante o envio")
+        b.write(c); n -= len(c)' "$1" "$2" "$3" "$4"
+}
+
+# "received" de uma resposta (no 409 pode vir no topo ou dentro do detail)
+received_of() { # $1 = arquivo com o corpo -> número ou vazio
+  python3 -c 'import json,sys
+try: d=json.load(open(sys.argv[1]))
+except Exception: d={}
+v=d.get("received") if isinstance(d,dict) else None
+if v is None and isinstance(d,dict) and isinstance(d.get("detail"),dict): v=d["detail"].get("received")
+print(v if isinstance(v,int) else "")' "$1"
+}
+
+# Linha de progresso. No terminal reescreve a mesma linha; em log (sem tty)
+# imprime uma linha por parte.
+progress() { # $1 = rótulo, $2 = já no hub, $3 = total, $4 = bytes desta execução, $5 = segundos
+  local line
+  line="$(awk -v l="$1" -v r="$2" -v t="$3" -v b="$4" -v s="$5" 'function h(n,  u,i){split("B KB MB GB TB",u," ");i=1
+      while(n>=1024&&i<5){n/=1024;i++} return (i==1)?sprintf("%d B",n):sprintf(n<10?"%.1f %s":"%.0f %s",n,u[i])}
+    BEGIN { if (s < 1) s = 1; if (b < 0) b = 0; v = b / s; eta = ""
+      if (v > 0 && r < t) { e = (t - r) / v; eta = (e >= 3600) ? sprintf("  falta ~%dh%02dmin", e/3600, (e%3600)/60) : sprintf("  falta ~%dmin%02ds", e/60, e%60) }
+      printf "%s  %3d%%  %s de %s  %s/s%s", l, (t ? int(100*r/t) : 100), h(r), h(t), h(v), eta }')"
+  if [ -t 2 ]; then printf '\r%s\033[K' "$line" >&2; else printf '%s\n' "$line" >&2; fi
+}
+
+# Envio em partes: POST /files/uploads, um PUT por parte, POST .../complete.
+# O estado fica no hub: um POST com o mesmo caminho e tamanho devolve o upload
+# que estava pela metade com o "received" atual, então o cliente não guarda nada
+# e "rodar o push de novo" é a retomada. O arquivo só aparece no destino no
+# complete (nunca pela metade pra um job que esteja lendo).
+upload_big() { # $1 = arquivo local, $2 = caminho lógico final, $3 = rótulo, $4 = tamanho
+  local f="$1" path="$2" label="$3" size="$4"
+  local body part code id="" chunk=0 received=0 tries n r start sent0 reopened=0
+  mktmp body; mktmp part
+  local open_json
+  open_json="$(python3 -c 'import json,sys;print(json.dumps({"path":sys.argv[1],"size":int(sys.argv[2]),"overwrite":sys.argv[3]=="1"}))' \
+    "$path" "$size" "$OVERWRITE")"
+
+  open_upload() { # preenche id/chunk/received de upload_big (escopo dinâmico do bash)
+    tries=0
+    while :; do
+      code="$(req "$body" POST /files/uploads --connect-timeout 20 -H 'Content-Type: application/json' --data-binary "$open_json")"
+      case "$code" in
+        200|201) break ;;
+        000|408|5??) tries=$((tries+1)); backoff "$tries" "$label: não consegui abrir o envio (HTTP $code)" ;;
+        404)
+          # hub antigo, sem envio em partes (404 da rota, não do caminho)
+          if [ "$(err_detail "$body")" = "Not Found" ] && [ "$size" -le $((MAX_MB * 1048576)) ]; then
+            echo "$label: o hub não tem envio em partes; mandando inteiro" >&2
+            upload_one "$f" "${path%/*}" "$label"; id=""; return 0
+          fi
+          http_fail "$code" "$body" ;;
+        429) die "$label: você já tem envios demais em andamento no hub (429). Termine ou cancele os outros (ou espere eles expirarem) e rode o push de novo" ;;
+        *) http_fail "$code" "$body" ;;
+      esac
+    done
+    id="$(pyget upload_id < "$body")"; chunk="$(pyget chunk_size < "$body")"; received="$(pyget received < "$body")"
+    [ -n "$id" ] && [[ "$chunk" =~ ^[0-9]+$ ]] && [ "$chunk" -gt 0 ] && [[ "$received" =~ ^[0-9]+$ ]] \
+      || die "resposta inesperada do hub ao abrir o envio: $(cat "$body")"
+    if [ "$received" -gt 0 ]; then
+      echo "$label: retomando de $(hum "$received") ($(( received * 100 / size ))%)" >&2
+    fi
+    return 0
+  }
+
+  open_upload
+  [ -n "$id" ] || return 0   # caiu no upload simples
+  start="$(date +%s)"; sent0="$received"; tries=0
+  progress "$label" "$received" "$size" 0 1
+  while [ "$received" -lt "$size" ]; do
+    n=$(( size - received )); [ "$n" -gt "$chunk" ] && n="$chunk"
+    cut_part "$f" "$received" "$n" "$part"
+    # -T faz streaming do arquivo da parte (--data-binary @ leria tudo pra
+    # memória antes). "Expect:" vazio: sem a espera do 100-continue.
+    # --speed-*: conexão travada (<1 KB/s por 60 s) vira falha e nova tentativa
+    # em vez de ficar parada pra sempre.
+    code="$(req "$body" PUT "/files/uploads/$id?offset=$received" --connect-timeout 20 \
+      --speed-limit 1024 --speed-time 60 -H 'Content-Type: application/octet-stream' -H 'Expect:' -T "$part")"
+    case "$code" in
+      200)
+        r="$(pyget received < "$body")"
+        [[ "$r" =~ ^[0-9]+$ ]] || die "resposta inesperada do hub: $(cat "$body")"
+        received="$r"; tries=0 ;;
+      409)
+        # o hub tem outra quantidade (parte anterior chegou pela metade, ou
+        # outro push do mesmo arquivo andou): segue do que ele diz que tem
+        r="$(received_of "$body")"
+        [ -n "$r" ] || http_fail "$code" "$body"
+        received="$r" ;;
+      404)
+        # upload sumiu (cancelado na página ou expirou): abre de novo, uma vez
+        [ "$reopened" = 0 ] || http_fail "$code" "$body"
+        reopened=1; echo >&2; echo "$label: o envio sumiu do hub; recomeçando" >&2
+        open_upload; sent0="$received"; start="$(date +%s)" ;;
+      000|408|429|5??)
+        tries=$((tries+1)); backoff "$tries" "$label: parte em $(hum "$received") falhou (HTTP $code)" ;;
+      *) echo >&2; http_fail "$code" "$body" ;;
+    esac
+    progress "$label" "$received" "$size" $(( received - sent0 )) $(( $(date +%s) - start ))
+  done
+  rm -f "$part"
+  tries=0
+  while :; do
+    code="$(req "$body" POST "/files/uploads/$id/complete" --connect-timeout 20)"
+    case "$code" in
+      2??) break ;;
+      000|408|5??) tries=$((tries+1)); backoff "$tries" "$label: não consegui concluir (HTTP $code)" ;;
+      *) echo >&2; http_fail "$code" "$body" ;;
+    esac
+  done
+  [ -t 2 ] && echo >&2
+  echo "$label: ok" >&2
+}
+
+# Lista uma pasta do hub em "nome<TAB>tipo<TAB>tamanho". Pasta que não existe
+# vira lista vazia e REMOTE_MISSING=1 (o push cria).
+remote_ls() { # $1 = caminho lógico, $2 = arquivo de saída
+  local body code; mktmp body
+  REMOTE_MISSING=0
+  code="$(req "$body" GET "/files?path=$(urlenc "$1")")"
+  case "$code" in
+    2??) python3 -c 'import json,sys
+for e in json.load(open(sys.argv[1])).get("entries") or []:
+    print("%s\t%s\t%s" % (e.get("name"), "d" if e.get("type") == "dir" else "f", e.get("size") or 0))' "$body" > "$2" ;;
+    404) : > "$2"; REMOTE_MISSING=1 ;;
+    *) http_fail "$code" "$body" ;;
+  esac
+  rm -f "$body"
+}
+
+# Decide e envia um arquivo. Mesmo nome e mesmo tamanho no hub = igual (pula):
+# é o que torna o push incremental e barato de repetir. Tamanho diferente só é
+# substituído com --overwrite (não apaga trabalho de ninguém por engano).
+push_file() { # $1 = arquivo local, $2 = pasta remota, $3 = rótulo, $4 = listagem da pasta remota
+  local f="$1" name sz rsz
+  name="$(basename "$f")"
+  sz="$(wc -c < "$f" | tr -d ' ')"
+  rsz="$(awk -F'\t' -v n="$name" '$1 == n && $2 == "f" { print $3; exit }' "$4")"
+  if [ -n "$rsz" ]; then
+    if [ "$rsz" = "$sz" ]; then
+      echo "$3: igual, pulando" >&2; PUSH_SKIP=$((PUSH_SKIP+1)); return 0
+    fi
+    if [ "$OVERWRITE" != 1 ]; then
+      echo "$3: já existe no hub com outro tamanho ($(hum "$rsz") lá, $(hum "$sz") aqui); mantive o do hub" >&2
+      PUSH_DIFF=$((PUSH_DIFF+1)); return 0
+    fi
+  fi
+  if [ "$sz" -gt "$BIG_BYTES" ]; then
+    upload_big "$f" "$2/$name" "$3" "$sz"
+  else
+    upload_one "$f" "$2" "$3"
+  fi
+  PUSH_SENT=$((PUSH_SENT+1))
 }
 
 # o que nunca sobe numa pasta (igual ao submit): grande e inútil no hub
 PRUNE=( \( -name .git -o -name .venv -o -name venv -o -name __pycache__ -o -name node_modules \) -prune )
 
 cmd_push() {
-  local src="${1:-}"; [ -n "$src" ] || die "uso: gpuhub push <arquivo|pasta> [destino no hub, padrão home]"
+  OVERWRITE=0
+  local args=() a
+  for a in "$@"; do
+    case "$a" in
+      --overwrite) OVERWRITE=1 ;;
+      -h|--help) usage ;;
+      -*) die "opção desconhecida: $a" ;;
+      *) args+=("$a") ;;
+    esac
+  done
+  [ ${#args[@]} -ge 1 ] && [ ${#args[@]} -le 2 ] \
+    || die "uso: gpuhub push [--overwrite] <arquivo|pasta> [destino no hub, padrão home]"
+  local src="${args[0]}"
   [ -e "$src" ] || die "não achei '$src'"
-  local dest; dest="$(norm_remote "${2:-home}")"
+  local dest; dest="$(norm_remote "${args[1]:-home}")"
   load_auth
+  # Ctrl+C: o curl morre junto (mesmo grupo de processos) e o bash cai aqui.
+  # Nada se perde: as partes já estão no hub esperando o mesmo push.
+  trap 'echo >&2; echo "interrompido. Rode o mesmo gpuhub push de novo: o que já subiu fica no hub e o envio continua de onde parou." >&2; exit 130' INT
+  PUSH_SENT=0; PUSH_SKIP=0; PUSH_DIFF=0
+  local ls; mktmp ls
   if [ -f "$src" ]; then
-    upload_one "$src" "$dest" "$(basename "$src")"
-    echo "enviado para $dest/$(basename "$src")"
+    remote_ls "$dest" "$ls"
+    push_file "$src" "$dest" "$(basename "$src")" "$ls"
+    push_summary "$dest"
     return
   fi
-  # pasta: recria a árvore (mkdir) e manda arquivo a arquivo — simples e dá
-  # progresso por arquivo; se cair no meio, é só mandar de novo
-  local base top list total i=0 rel d
+  [ -d "$src" ] || die "'$src' não é arquivo nem pasta"
+  # pasta: percorre pasta a pasta. Cada pasta remota é listada uma vez só
+  # (uma chamada) e os arquivos dela são comparados com essa lista.
+  local base name top dirs total i=0 rel rdir fp
   base="$(cd "$src" && pwd -P)"
-  top="$dest/$(basename "$base")"
-  remote_mkdir "$top"
-  mktmp list
-  ( cd "$base" && find . "${PRUNE[@]}" -o \( -type d -o -type f \) -print0 ) > "$list"
+  name="$(basename "$base")"
+  case "$dest" in
+    */"$name") top="$dest" ;;   # push dados home/dados: não vira home/dados/dados
+    *) top="$dest/$name" ;;
+  esac
+  mktmp dirs
+  ( cd "$base" && find . "${PRUNE[@]}" -o -type d -print0 ) > "$dirs"
   total="$( (cd "$base" && find . "${PRUNE[@]}" -o -type f -print) | wc -l | tr -d ' ')"
-  while IFS= read -r -d '' rel; do
-    rel="${rel#./}"; [ "$rel" = "." ] && continue
-    if [ -d "$base/$rel" ]; then
-      remote_mkdir "$top/$rel"
-    else
+  echo "$base -> $top ($total arquivo(s))" >&2
+  # fd 3 e 4: os comandos de dentro do laço (curl, python) não herdam a lista no stdin
+  while IFS= read -r -d '' -u 3 rel; do
+    rel="${rel#./}"; [ "$rel" = "." ] && rel=""
+    rdir="$top${rel:+/$rel}"
+    remote_ls "$rdir" "$ls"
+    # cria só o que falta; os uploads também criam as pastas pai, então isto
+    # importa mesmo é pra pasta vazia
+    [ "$REMOTE_MISSING" = 1 ] && remote_mkdir "$rdir"
+    while IFS= read -r -d '' -u 4 fp; do
       i=$((i+1))
-      d="$(dirname "$rel")"; if [ "$d" = "." ]; then d=""; else d="/$d"; fi
-      upload_one "$base/$rel" "$top$d" "[$i/$total] $rel"
-    fi
-  done < "$list"
-  echo "enviado: $i arquivo(s) para $top"
+      push_file "$fp" "$rdir" "[$i/$total] ${rel:+$rel/}$(basename "$fp")" "$ls"
+    done 4< <(find "$base${rel:+/$rel}" -mindepth 1 -maxdepth 1 -type f -print0)
+  done 3< "$dirs"
+  push_summary "$top"
+}
+
+push_summary() { # $1 = destino
+  local msg="pronto ($1): $PUSH_SENT enviado(s), $PUSH_SKIP igual(is) pulado(s)"
+  if [ "$PUSH_DIFF" -gt 0 ]; then
+    echo "$msg, $PUSH_DIFF diferente(s) mantido(s) como estão no hub"
+    echo "para substituir os diferentes: rode o mesmo push com --overwrite" >&2
+    exit 1   # script que chama precisa saber que nem tudo foi pro hub
+  fi
+  echo "$msg"
 }
 
 download_one() { # $1 = caminho lógico, $2 = arquivo local
@@ -808,6 +1044,22 @@ cmd_mkdir() {
   echo "criado: $p"
 }
 
+# Cota da home (home/, inclusive home/jobs). datasets/ não conta.
+cmd_quota() {
+  load_auth
+  api GET /quota | python3 -c 'import json,sys
+d=json.load(sys.stdin); u=d.get("used_bytes") or 0; q=d.get("quota_bytes"); G=1024**3
+if q is None:
+    print("%s: usa %.1f GB (sem limite)" % (d.get("user"), u/G)); sys.exit()
+# cota 0 (admin bloqueou envios) vale como cheia; sem dividir por zero
+pct=100*u/q if q else 100
+print("%s: usa %.1f GB de %.0f GB (%.0f%%)" % (d.get("user"), u/G, q/G, pct))
+w=30; f=min(w, int(round(w*u/q))) if q else w
+print("[" + "#"*f + "."*(w-f) + "]")
+if pct >= 90:
+    print("quase cheia: apague o que não usa (gpuhub files / gpuhub rm -r) ou peça mais cota ao professor")'
+}
+
 # ---------------------------------------------------------------- admin
 
 # lê --role/--days e imprime o JSON; com EXTRA_EMAIL inclui nome/email (admin add)
@@ -842,8 +1094,8 @@ show_key() { # $1 = JSON com api_key, $2 = usuário (se a resposta não trouxer)
 cmd_admin() {
   local sub="${1:-}" resp q id
   [ $# -gt 0 ] && shift
-  case "$sub" in requests|approve|deny|users|revoke|rotate|add) ;;
-    *) die "subcomando admin: requests | approve | deny | users | revoke | rotate | add (ajuda: gpuhub help)" ;;
+  case "$sub" in requests|approve|deny|users|revoke|rotate|add|quota) ;;
+    *) die "subcomando admin: requests | approve | deny | users | revoke | rotate | add | quota (ajuda: gpuhub help)" ;;
   esac
   load_auth
   case "$sub" in
@@ -871,10 +1123,15 @@ if pend: print("\naprovar: gpuhub admin approve <id> [--role professor] [--days 
 us=json.load(sys.stdin)
 if not us: print("nenhum usuário com key ainda"); sys.exit()
 d=lambda s: (s or "-")[:10]
-t=[("USUARIO","PAPEL","KEY","EXPIRA","ULTIMO USO","SITUACAO","EMAIL")]
+G=1024**3
+def uso(u):
+    used = u.get("used_bytes")
+    q = u.get("quota_gb")
+    return "%s/%s" % ("-" if used is None else "%.1f" % (used/G), "padrao" if q is None else "%sGB" % q)
+t=[("USUARIO","PAPEL","KEY","EXPIRA","ULTIMO USO","SITUACAO","USO/COTA","EMAIL")]
 for u in us:
     t.append((u.get("user") or "-", u.get("role") or "-", u.get("key_prefix") or "-", d(u.get("expires_at")),
-              d(u.get("last_used_at")), "revogada" if u.get("revoked") else "ativa", u.get("email") or "-"))
+              d(u.get("last_used_at")), "revogada" if u.get("revoked") else "ativa", uso(u), u.get("email") or "-"))
 w=[max(len(r[i]) for r in t) for i in range(len(t[0]))]
 for r in t: print("  ".join(c.ljust(w[i]) for i,c in enumerate(r)).rstrip())' ;;
     revoke)
@@ -890,6 +1147,14 @@ for r in t: print("  ".join(c.ljust(w[i]) for i,c in enumerate(r)).rstrip())' ;;
       q="$(EXTRA_NAME="$name" EXTRA_EMAIL="$email" role_days_json "$@")"
       resp="$(api_json POST /admin/users "$q")"
       show_key "$resp" ;;
+    quota)
+      [ $# -eq 2 ] || die "uso: gpuhub admin quota <usuario> <gb|padrao>"
+      case "$2" in
+        padrao|padrão|default) q=null ;;
+        *) [[ "$2" =~ ^[0-9]+$ ]] || die "cota em GB inteiros (ex.: 500) ou 'padrao'"; q="$((10#$2))" ;;
+      esac
+      api_json POST "/admin/users/$(urlenc "$1")/quota" "{\"gb\": $q}" >/dev/null
+      if [ "$q" = null ]; then echo "cota de $1: padrão do hub."; else echo "cota de $1: $q GB."; fi ;;
   esac
 }
 
@@ -905,6 +1170,7 @@ case "${1:-}" in
   status)         shift; cmd_status "$@" ;;
   files|ls)       shift; cmd_files "$@" ;;
   push)           shift; cmd_push "$@" ;;
+  quota)          shift; cmd_quota "$@" ;;
   pull)           shift; cmd_pull "$@" ;;
   rm)             shift; cmd_rm "$@" ;;
   mkdir)          shift; cmd_mkdir "$@" ;;
