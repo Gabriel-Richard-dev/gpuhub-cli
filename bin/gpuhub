@@ -1167,7 +1167,7 @@ case "${1:-}" in
   request-access) shift; cmd_request_access "$@" ;;
   whoami)         shift; cmd_whoami "$@" ;;
   logout)         shift; cmd_logout "$@" ;;
-  submit)         shift; cmd_submit "$@" ;;
+  submit|summit|sumbit|submti) shift; cmd_submit "$@" ;;   # erros de digitação comuns
   queue)          shift; cmd_queue "$@" ;;
   logs)           shift; cmd_logs "$@" ;;
   stop)           shift; cmd_stop "$@" ;;
@@ -1179,5 +1179,8 @@ case "${1:-}" in
   rm)             shift; cmd_rm "$@" ;;
   mkdir)          shift; cmd_mkdir "$@" ;;
   admin)          shift; cmd_admin "$@" ;;
-  *)              usage ;;
+  ""|help|-h|--help) usage ;;
+  *)              echo "erro: comando desconhecido: $1   (veja: gpuhub help)" >&2
+                  echo "comandos: login whoami submit queue logs stop status files push pull quota rm mkdir admin" >&2
+                  exit 2 ;;
 esac
